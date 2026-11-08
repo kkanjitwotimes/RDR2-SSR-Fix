@@ -44,3 +44,5 @@ The output is build/RDR2OverscanVK.asi.
 **Shoutout [linehand](https://www.nexusmods.com/profile/linehand/mods?gameId=3024), they're my direct inspiration for this project, having made a DX12 version, this acts like a Vulkan alternative**
 
 ASI loader: https://github.com/ThirteenAG/Ultimate-ASI-Loader
+
+Mod on Nexus: https://www.nexusmods.com/reddeadredemption2/mods/11546
