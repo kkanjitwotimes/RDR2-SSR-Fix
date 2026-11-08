@@ -7,6 +7,8 @@ I'm no programmer, so I vibecoded this project :(
 
 Beyond this readme and the 12 messages I sent to claude, this project is entirely AI generated.
 # Usage
+Download RDR2.Vulkan.Overscan.zip from the `Releases` tab
+
 Put RDR2OverscanVK.asi inside the RDR2 root, requires an ASI loader
 
 On first run it creates the config file (RDR2Overscan.ini) next to the ASI, you can edit it while the game runs (reloads every ~30 frames)
