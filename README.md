@@ -19,7 +19,7 @@ EngageFrames and RampFrames control a zoom function on menu enter and exit, prev
 
 The logging feature takes 'snapshots' of the graphics pipeline under the hood upon initiating a hot key (default is backslash) for debugging and analysis.
 # Build Me :3 
-**Download [RDR2.Vulkan.Overscan_source.zip](https://github.com/kkanjitwotimes/RDR2-SSR-Fix/releases/download/v0.0.1/RDR2.Vulkan.Overscan_source.zip)**
+**Download RDR2.Vulkan.Overscan_source.zip for the version you're building from the `Releases` tab**
 
 This is above my larp level paygrade, here's what claude says:
 
