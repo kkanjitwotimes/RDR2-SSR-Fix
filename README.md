@@ -11,7 +11,7 @@ Download RDR2.Vulkan.Overscan.zip from the `Releases` tab
 
 Put RDR2OverscanVK.asi inside the RDR2 root, requires an ASI loader
 
-On first run it creates the config file (RDR2Overscan.ini) next to the ASI, you can edit it while the game runs (reloads every ~30 frames)
+On first run it creates the config file (RDR2Overscan.ini) next to the ASI, you can edit it while the game runs (checks for change once a second, reloads when changed)
 
 Zoom is responsible for the amount of, well, zoom, higher number = less artifacts but narrower FOV.
 
