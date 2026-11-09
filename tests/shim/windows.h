@@ -53,6 +53,8 @@ inline DWORD GetPrivateProfileStringW(LPCWSTR, LPCWSTR, LPCWSTR def, LPWSTR out,
 inline void GetLocalTime(SYSTEMTIME* t) { timeval tv; gettimeofday(&tv, nullptr); tm l; localtime_r(&tv.tv_sec, &l); t->wYear = l.tm_year + 1900; t->wMonth = l.tm_mon + 1; t->wDay = l.tm_mday; t->wHour = l.tm_hour; t->wMinute = l.tm_min; t->wSecond = l.tm_sec; t->wMilliseconds = tv.tv_usec / 1000; }
 inline BOOL QueryPerformanceFrequency(LARGE_INTEGER* f) { f->QuadPart = 1000000000LL; return TRUE; }
 inline BOOL QueryPerformanceCounter(LARGE_INTEGER* c) { timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); c->QuadPart = ts.tv_sec * 1000000000LL + ts.tv_nsec; return TRUE; }
+typedef unsigned long long ULONGLONG;
+inline ULONGLONG GetTickCount64() { timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (ULONGLONG)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000; }
 inline DWORD GetCurrentThreadId() { return g_fakeTid; }
 inline DWORD GetCurrentProcessId() { return 777; }
 inline HANDLE GetCurrentThread() { return nullptr; }

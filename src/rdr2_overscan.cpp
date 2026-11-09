@@ -1,4 +1,4 @@
-// RDR2 Vulkan overscan prototype (ASI).
+// RDR2 Vulkan overscan v0.0.2 (ASI).
 //
 // What it does: just before the first full-screen render pass that LOADs the backbuffer (the point the
 // reference FG mod uses as "pre-HUD"), it records  copy backbuffer -> private scratch, then
@@ -105,25 +105,51 @@ static std::wstring ModuleDir(HMODULE m) {
 static void WriteDefaultIni() {
   if (GetFileAttributesW(g_iniPath.c_str()) != INVALID_FILE_ATTRIBUTES) return;
   const char* text =
-    "; RDR2 Vulkan overscan prototype. This file is re-read about twice a second while the game runs.\r\n"
+    "; ==============================================================================\r\n"
+    "; RDR2 Vulkan overscan v0.0.2\r\n"
+    "; Saved changes are picked up while the game is running (checked about once a second).\r\n"
+    "; ==============================================================================\r\n"
+    "\r\n"
     "[Overscan]\r\n"
+    "\r\n"
+    "; Master switch: 1 = on, 0 = off.\r\n"
     "Enabled=1\r\n"
-    "; 1.05 = the centre 1/1.05 of the 3D image is stretched to fill the screen (clamped to 1.00 - 1.50)\r\n"
+    "\r\n"
+    "; Zoom factor for the 3D scene (the UI is left untouched).\r\n"
+    ";   1.05 = the centre 1/1.05 of the image is stretched to fill the screen.\r\n"
+    ";   Range: 1.00 - 1.50 (values outside are clamped).\r\n"
     "Zoom=1.05\r\n"
+    "\r\n"
     "; Which qualifying full-screen LOAD pass on the backbuffer gets the transform (1 = first).\r\n"
-    "; If the UI is zoomed, the transform is too early in the frame's order; if nothing changes, try 2, 3...\r\n"
+    ";   UI is zoomed too            -> the transform is too early in the frame, try a higher number\r\n"
+    ";   nothing changes at all      -> try 2, 3, ...\r\n"
     "TransformPassIndex=1\r\n"
-    "; After pause/menus the zoom stays off until the scene has been stable this many presented frames,\r\n"
-    "; then eases in over RampFrames (smoothstep). 0 and 0 = instant (old behaviour).\r\n"
-    "; 1 = only the pass that also writes depth (the main 3D scene pass) is transformed. Recording order across threads\r\n"
-    "; varies from frame to frame, so counting passes alone made the zoom land on different passes (flicker).\r\n"
+    "\r\n"
+    "; 1 = only the pass that also writes depth (the main 3D scene pass) is transformed.\r\n"
+    ";   RDR2 records its command buffers on several threads, so the recording order\r\n"
+    ";   varies from frame to frame. Counting passes alone made the zoom land on\r\n"
+    ";   different passes (flicker). Leave this at 1 unless you are debugging.\r\n"
     "RequireDepthWrite=1\r\n"
+    "\r\n"
+    "; After pause/menus the zoom stays off until the scene has been stable for\r\n"
+    "; EngageFrames presented frames, then eases in over RampFrames (smoothstep).\r\n"
+    ";   EngageFrames=0 and RampFrames=0 -> instant (old behaviour).\r\n"
     "EngageFrames=8\r\n"
     "RampFrames=30\r\n"
-    "\r\n[Log]\r\n"
-    "; Nothing is written until the key is pressed. 0xDC = backslash.\r\n"
+    "\r\n"
+    "\r\n"
+    "[Log]\r\n"
+    "\r\n"
+    "; Nothing is written until the capture key is pressed in the game window.\r\n"
+    ";   0xDC = backslash (virtual-key code)\r\n"
     "CaptureKey=0xDC\r\n"
+    "\r\n"
+    "; Number of frames recorded per capture (1 - 30).\r\n"
     "CaptureFrames=3\r\n"
+    "\r\n"
+    "; What to include in the capture log (1 = on, 0 = off).\r\n"
+    "; Submits and command-buffer begins make the log very large; turn them off\r\n"
+    "; if you only need the pass verdicts.\r\n"
     "LogPasses=1\r\n"
     "LogSubmits=1\r\n"
     "LogCommandBufferBegin=1\r\n";
@@ -150,7 +176,13 @@ static void LoadIni() {
   g_cfg.logCmdBegin = GetPrivateProfileIntW(L"Log", L"LogCommandBufferBegin", 1, f) != 0;
 }
 
+// Polled from Present; wall-clock throttled (~1 s) so it is frame-rate independent. Only the file's
+// metadata (last-write time) is queried; the INI is re-read solely when that timestamp has changed.
+static constexpr ULONGLONG kIniPollMs = 1000;
 static void MaybeReloadIni() {
+  static ULONGLONG last = 0; const ULONGLONG now = GetTickCount64();
+  if (last && now - last < kIniPollMs) return;
+  last = now;
   WIN32_FILE_ATTRIBUTE_DATA d{};
   if (!GetFileAttributesExW(g_iniPath.c_str(), GetFileExInfoStandard, &d)) return;
   if (CompareFileTime(&d.ftLastWriteTime, &g_iniStamp) != 0) { g_iniStamp = d.ftLastWriteTime; LoadIni(); }
@@ -579,7 +611,7 @@ static void OnPresent(const VkPresentInfoKHR* pi) {
   }
   g_cap.keyDown = down;
   if (g_frameQual.exchange(false)) { if (g_stableStreak < 100000) ++g_stableStreak; } else g_stableStreak = 0;
-  if (n % 30 == 0) MaybeReloadIni();
+  MaybeReloadIni();
   {
     std::lock_guard<std::mutex> lk(g_mu);
     if (pi) for (uint32_t i = 0; i < pi->swapchainCount; ++i) {
