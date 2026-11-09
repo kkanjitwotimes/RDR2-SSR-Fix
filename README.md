@@ -1,3 +1,7 @@
+# This is the testing grounds...
+This beta branch serves as a testing ground for unfinished/WIP updates and features, use at the risk of crashes and major issues.
+**PLEASE REPORT BUGS :<**
+
 # RDR2-SSR-Fix
 A customizable ASI mod for RDR2 that effectively crops the viewport, allowing screen-space to see 'off-screen', mitigating edge screen artifacting under SSR/SSS.
 
