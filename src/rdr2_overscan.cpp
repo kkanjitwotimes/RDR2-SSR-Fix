@@ -1,4 +1,4 @@
-// RDR2 Vulkan overscan v0.0.2 (ASI).
+// RDR2 Vulkan overscan v0.0.3 (ASI).
 //
 // What it does: just before the first full-screen render pass that LOADs the backbuffer (the point the
 // reference FG mod uses as "pre-HUD"), it records  copy backbuffer -> private scratch, then
@@ -32,6 +32,7 @@
 #include <unordered_map>
 #include <vector>
 #include "overscan_core.h"
+#include "sharpen.h"
 
 namespace ovs {
 
@@ -45,7 +46,8 @@ namespace ovs {
   X(CreateRenderPass) X(CreateRenderPass2) X(DestroyRenderPass) \
   X(CmdBeginRenderPass) X(CmdBeginRenderPass2) X(CmdBeginRendering) \
   X(QueueSubmit) X(QueueSubmit2) X(CmdExecuteCommands) X(BeginCommandBuffer) \
-  X(CmdPipelineBarrier) X(CmdPipelineBarrier2) X(CmdCopyImage) X(CmdBlitImage) X(CmdClearColorImage)
+  X(CmdPipelineBarrier) X(CmdPipelineBarrier2) X(CmdCopyImage) X(CmdBlitImage) X(CmdClearColorImage) \
+  X(CmdBindPipeline) X(CmdBindDescriptorSets) X(CmdPushConstants) X(CmdSetViewport) X(CmdSetScissor) X(CmdSetViewportWithCount) X(CmdSetScissorWithCount)
 
 enum HookId {
 #define X(n) HK_##n,
@@ -88,6 +90,8 @@ struct Config {
   std::atomic<double> zoom{1.05};
   std::atomic<int> engageFrames{8}, rampFrames{30};
   std::atomic<bool> requireDepth{true};
+  std::atomic<double> sharp{0.0};       // CAS sharpening strength 0..1 (0 = off: plain bilinear blit)
+  std::atomic<bool> holdZoom{true};     // keep the engaged zoom across pause/menu frames (no re-ramp while paused)
   std::atomic<int> passIndex{1};        // which qualifying pass per frame gets the transform (1 = first)
   std::atomic<int> captureFrames{3};
   std::atomic<int> captureKey{0xDC};    // VK_OEM_5, the backslash key on a US layout
@@ -106,7 +110,7 @@ static void WriteDefaultIni() {
   if (GetFileAttributesW(g_iniPath.c_str()) != INVALID_FILE_ATTRIBUTES) return;
   const char* text =
     "; ==============================================================================\r\n"
-    "; RDR2 Vulkan overscan v0.0.2\r\n"
+    "; RDR2 Vulkan overscan v0.0.3\r\n"
     "; Saved changes are picked up while the game is running (checked about once a second).\r\n"
     "; ==============================================================================\r\n"
     "\r\n"
@@ -131,11 +135,27 @@ static void WriteDefaultIni() {
     ";   different passes (flicker). Leave this at 1 unless you are debugging.\r\n"
     "RequireDepthWrite=1\r\n"
     "\r\n"
-    "; After pause/menus the zoom stays off until the scene has been stable for\r\n"
-    "; EngageFrames presented frames, then eases in over RampFrames (smoothstep).\r\n"
+    "; The zoom stays off until the scene has been stable for EngageFrames presented\r\n"
+    "; frames, then eases in over RampFrames (smoothstep).\r\n"
     ";   EngageFrames=0 and RampFrames=0 -> instant (old behaviour).\r\n"
+    ";   NOTE: since HoldZoomOnPause (below) was added, pausing no longer resets this\r\n"
+    ";   state, so these two settings mostly matter right after launch. Their\r\n"
+    ";   behaviour may be altered or reworked in a future version.\r\n"
     "EngageFrames=8\r\n"
     "RampFrames=30\r\n"
+    "\r\n"
+    "; 1 = pausing/opening menus does NOT reset the engage/ramp state, so the game\r\n"
+    ";   behind a pause menu stays zoomed instead of unzoomed-then-zooming-in.\r\n"
+    "; 0 = old behaviour (state resets on every frame without a scene pass).\r\n"
+    "HoldZoomOnPause=1\r\n"
+    "\r\n"
+    "; Sharpening of the zoomed 3D scene (AMD FidelityFX CAS, contrast adaptive). The UI is untouched.\r\n"
+    ";   EXPERIMENTAL: runs an extra full-screen shader pass and may cause a small\r\n"
+    ";   performance penalty.\r\n"
+    ";   0.0 = off (plain bilinear zoom, default).  0.3-0.6 is a sensible starting range, 1.0 = strongest.\r\n"
+    ";   Applies live. If the pass cannot be built the mod silently keeps the plain zoom\r\n"
+    ";   (the capture log shows sharpen=on / FAILED: reason per swapchain).\r\n"
+    "Sharpness=0.0\r\n"
     "\r\n"
     "\r\n"
     "[Log]\r\n"
@@ -167,6 +187,8 @@ static void LoadIni() {
   { int e = (int)GetPrivateProfileIntW(L"Overscan", L"EngageFrames", 8, f), r = (int)GetPrivateProfileIntW(L"Overscan", L"RampFrames", 30, f);
     g_cfg.engageFrames = e < 0 ? 0 : e > 600 ? 600 : e; g_cfg.rampFrames = r < 0 ? 0 : r > 600 ? 600 : r; }
   g_cfg.requireDepth = GetPrivateProfileIntW(L"Overscan", L"RequireDepthWrite", 1, f) != 0;
+  g_cfg.holdZoom = GetPrivateProfileIntW(L"Overscan", L"HoldZoomOnPause", 1, f) != 0;
+  { wchar_t ss[32]{}; GetPrivateProfileStringW(L"Overscan", L"Sharpness", L"0.0", ss, 32, f); double sv = wcstod(ss, nullptr); if (!(sv > 0.0)) sv = 0.0; if (sv > 1.0) sv = 1.0; g_cfg.sharp = sv; }
   int pi = (int)GetPrivateProfileIntW(L"Overscan", L"TransformPassIndex", 1, f); g_cfg.passIndex = pi < 1 ? 1 : pi;
   wchar_t ks[32]{}; GetPrivateProfileStringW(L"Log", L"CaptureKey", L"0xDC", ks, 32, f);
   long k = wcstol(ks, nullptr, 0); g_cfg.captureKey = k > 0 && k < 256 ? (int)k : 0xDC;
@@ -232,15 +254,20 @@ struct Slot { VkImage image{}, scratch{}; VkDeviceMemory mem{}; uint32_t qualSee
 struct Swapchain {
   VkSwapchainKHR h{}; VkDevice dev{}; VkFormat fmt{}; VkExtent2D ext{};
   VkImageUsageFlags requestedUsage = 0, usage = 0; VkPresentModeKHR mode{}; uint32_t minImages = 0;
-  bool bumped = false, usable = false; std::string whyNot = "images not yet retrieved";
+  bool bumped = false, usable = false, sharpPossible = false; std::shared_ptr<sharpen::Res> sharp;
+  std::string whyNot = "images not yet retrieved";
   DevFns fn; std::vector<Slot> slots;
 };
 struct ViewInfo { VkImage image; VkFormat format; VkImageSubresourceRange range; };
 struct AttDesc { VkFormat format; VkSampleCountFlagBits samples; VkAttachmentLoadOp load; VkAttachmentStoreOp store; VkImageLayout initial; bool color; };
 struct FbInfo { VkRenderPass pass; uint32_t w, h, layers; bool imageless; std::vector<VkImageView> views; };
-struct Retired { VkDevice dev; DevFns fn; std::vector<Slot> slots; uint64_t freeAt; };
+struct Retired { VkDevice dev; DevFns fn; std::vector<Slot> slots; uint64_t freeAt; std::shared_ptr<sharpen::Res> sharp; };
 
 static std::mutex g_mu;   // guards every map below
+// Shadow of the graphics state the CAS pass overwrites, per command buffer (only maintained while Sharpness > 0).
+// A command buffer is recorded by one thread at a time and the pass is recorded on that same thread, so the shadow is thread-local (no locking).
+static thread_local std::unordered_map<VkCommandBuffer, sharpen::Shadow> g_cs;
+template <class F> static inline void Shadowed(VkCommandBuffer c, F fn) { if (g_cfg.sharp.load() <= 0.0) return; fn(g_cs[c]); }
 static std::unordered_map<VkSwapchainKHR, std::unique_ptr<Swapchain>> g_sc;
 static std::unordered_map<VkImage, std::pair<Swapchain*, uint32_t>> g_imgRef;
 static std::unordered_map<VkImageView, ViewInfo> g_views;
@@ -303,6 +330,8 @@ static void BuildSlots(Swapchain& sc, const std::vector<VkImage>& images) {
   VkFormatProperties fp{}; g_fnFormatProps(g_pd, sc.fmt, &fp);
   const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
   if ((fp.optimalTilingFeatures & need) != need) { sc.whyNot = Fmt("format %d lacks BLIT_SRC/BLIT_DST/FILTER_LINEAR (features=0x%x)", (int)sc.fmt, (unsigned)fp.optimalTilingFeatures); return; }
+  sc.sharpPossible = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) && (sc.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+  sc.sharp = sc.sharpPossible ? std::make_shared<sharpen::Res>() : nullptr;
   VkPhysicalDeviceMemoryProperties mp{}; g_fnMemProps(g_pd, &mp);
   std::vector<Slot> slots(images.size());
   for (size_t i = 0; i < images.size(); ++i) {
@@ -310,7 +339,7 @@ static void BuildSlots(Swapchain& sc, const std::vector<VkImage>& images) {
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ci.imageType = VK_IMAGE_TYPE_2D; ci.format = sc.fmt; ci.extent = {sc.ext.width, sc.ext.height, 1};
     ci.mipLevels = 1; ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_1_BIT; ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT; ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (sc.sharpPossible ? VK_IMAGE_USAGE_SAMPLED_BIT : 0); ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkResult r = sc.fn.createImage(sc.dev, &ci, nullptr, &s.scratch);
     if (r != VK_SUCCESS) { sc.whyNot = Fmt("vkCreateImage(scratch) failed: %d", (int)r); FreeSlots(sc.dev, sc.fn, slots); return; }
@@ -348,6 +377,27 @@ static void RecordTransform(const Swapchain& sc, const Slot& s, VkCommandBuffer 
   // 2. full copy
   VkImageCopy cp{}; cp.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp.dstSubresource = cp.srcSubresource; cp.extent = {sc.ext.width, sc.ext.height, 1};
   f.copy(cmd, s.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.scratch, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+  // 2b. optional CAS pass: sample the scratch copy, rewrite the backbuffer with a fragment shader (no blit)
+  if (const float sh = (float)g_cfg.sharp.load(); sh > 0.f && sc.sharpPossible && sc.sharp && layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
+    sharpen::Res& res = *sc.sharp; const uint32_t idx = (uint32_t)(&s - sc.slots.data());
+    if (!res.ok && !res.tried) {
+      std::vector<VkImage> sw, sr; for (const Slot& q : sc.slots) { sw.push_back(q.image); sr.push_back(q.scratch); }
+      const bool ok = sharpen::Init(res, sc.dev, o_GDPA, sc.fmt, sc.ext, sw, sr);
+      Event(ok ? Fmt("sharpen pass ready for swapchain 0x%llx", H64(sc.h)) : Fmt("sharpen pass unavailable for swapchain 0x%llx (using plain blit): %s", H64(sc.h), res.why.c_str()));
+    }
+    if (res.ok && idx < res.set.size()) {
+      VkImageMemoryBarrier b2s[2] = {
+        bar(s.scratch, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT),
+        bar(s.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)};
+      f.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 2, b2s);
+      sharpen::Record(res, cmd, idx, cr.dx, cr.dy, cr.srcW, cr.srcH, sh);
+      { auto it = g_cs.find(cmd); if (it != g_cs.end()) sharpen::Restore(res, cmd, it->second); }   // give the game its state back
+      VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER}; mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+      f.barrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+      return;
+    }
+    // not ready: fall through to the plain blit below
+  }
   // 3. scratch -> TRANSFER_SRC ; backbuffer -> TRANSFER_DST
   VkImageMemoryBarrier b2[2] = {
     bar(s.scratch, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT),
@@ -486,6 +536,12 @@ static void OnBeginRendering(VkCommandBuffer cmd, const VkRenderingInfo* ri, con
 // ============================================================================================
 // Swapchain / resource lifecycle
 // ============================================================================================
+static std::string SharpStatus(const Swapchain& sc) {
+  if (!sc.sharpPossible || !sc.sharp) return "unsupported";
+  if (sc.sharp->ok) return g_cfg.sharp.load() > 0 ? "on" : "ready(off)";
+  if (sc.sharp->tried) return "FAILED: " + sc.sharp->why;
+  return g_cfg.sharp.load() > 0 ? "pending" : "off";
+}
 static void OnDeviceCreated(VkPhysicalDevice pd, VkDevice dev) {
   std::lock_guard<std::mutex> lk(g_mu);
   if (!g_firstDevice) { g_firstDevice = dev; g_pd = pd; Event(Fmt("first device 0x%llx on physical device 0x%llx", H64(dev), H64(pd))); }
@@ -506,7 +562,7 @@ static void OnSwapchainImages(VkSwapchainKHR h, uint32_t n, const VkImage* imgs)
   auto it = g_sc.find(h); if (it == g_sc.end()) { Event(Fmt("images queried for unknown swapchain 0x%llx (created before the hook?)", H64(h))); return; }
   Swapchain& sc = *it->second;
   if (sc.slots.size() == n) { bool same = true; for (uint32_t i = 0; i < n; ++i) if (sc.slots[i].image != imgs[i]) same = false; if (same) return; }
-  if (!sc.slots.empty()) { for (auto& s : sc.slots) g_imgRef.erase(s.image); g_retired.push_back({sc.dev, sc.fn, std::move(sc.slots), g_presents.load() + 16}); sc.slots.clear(); }
+  if (!sc.slots.empty()) { for (auto& s : sc.slots) g_imgRef.erase(s.image); g_retired.push_back({sc.dev, sc.fn, std::move(sc.slots), g_presents.load() + 16, std::move(sc.sharp)}); sc.slots.clear(); }
   std::vector<VkImage> v(imgs, imgs + n);
   BuildSlots(sc, v);
   Event(sc.usable ? Fmt("swapchain 0x%llx: %u images, scratch images allocated, transform usable", H64(h), n) : Fmt("swapchain 0x%llx: %u images, transform NOT usable: %s", H64(h), n, sc.whyNot.c_str()));
@@ -517,7 +573,7 @@ static void OnSwapchainDestroy(VkSwapchainKHR h) {
   auto it = g_sc.find(h); if (it == g_sc.end()) return;
   Swapchain& sc = *it->second;
   for (auto& s : sc.slots) g_imgRef.erase(s.image);
-  if (!sc.slots.empty()) g_retired.push_back({sc.dev, sc.fn, std::move(sc.slots), g_presents.load() + 16});
+  if (!sc.slots.empty()) g_retired.push_back({sc.dev, sc.fn, std::move(sc.slots), g_presents.load() + 16, std::move(sc.sharp)});
   Event(Fmt("swapchain 0x%llx destroyed; scratch images retired for 16 presents", H64(h)));
   g_sc.erase(it);
 }
@@ -566,7 +622,7 @@ static void BeginCapture() {
     h += Fmt("%sswapchains: %zu\n", Indent(1), g_sc.size());
     for (auto& kv : g_sc) {
       const Swapchain& sc = *kv.second;
-      h += Fmt("%s0x%llx %ux%u fmt=%s(%d) presentMode=%d minImages=%u images=%zu usage requested=0x%x actual=0x%x bumped=%s usable=%s%s%s\n", Indent(2), H64(sc.h), sc.ext.width, sc.ext.height, FormatName((int)sc.fmt), (int)sc.fmt, (int)sc.mode, sc.minImages, sc.slots.size(), (unsigned)sc.requestedUsage, (unsigned)sc.usage, sc.bumped ? "yes" : "no", sc.usable ? "yes" : "no", sc.usable ? "" : " reason: ", sc.usable ? "" : sc.whyNot.c_str());
+      h += Fmt("%s0x%llx %ux%u fmt=%s(%d) presentMode=%d minImages=%u images=%zu usage requested=0x%x actual=0x%x bumped=%s usable=%s%s%s sharpen=%s\n", Indent(2), H64(sc.h), sc.ext.width, sc.ext.height, FormatName((int)sc.fmt), (int)sc.fmt, (int)sc.mode, sc.minImages, sc.slots.size(), (unsigned)sc.requestedUsage, (unsigned)sc.usage, sc.bumped ? "yes" : "no", sc.usable ? "yes" : "no", sc.usable ? "" : " reason: ", sc.usable ? "" : sc.whyNot.c_str(), SharpStatus(sc).c_str());
       for (size_t i = 0; i < sc.slots.size(); ++i) h += Fmt("%simage[%zu]=0x%llx scratch=0x%llx\n", Indent(3), i, H64(sc.slots[i].image), H64(sc.slots[i].scratch));
     }
   }
@@ -610,7 +666,7 @@ static void OnPresent(const VkPresentInfoKHR* pi) {
     if (pid == GetCurrentProcessId()) BeginCapture();
   }
   g_cap.keyDown = down;
-  if (g_frameQual.exchange(false)) { if (g_stableStreak < 100000) ++g_stableStreak; } else g_stableStreak = 0;
+  if (g_frameQual.exchange(false)) { if (g_stableStreak < 100000) ++g_stableStreak; } else if (!g_cfg.holdZoom.load()) g_stableStreak = 0;
   MaybeReloadIni();
   {
     std::lock_guard<std::mutex> lk(g_mu);
@@ -619,7 +675,7 @@ static void OnPresent(const VkPresentInfoKHR* pi) {
       if (it != g_sc.end() && pi->pImageIndices[i] < it->second->slots.size()) it->second->slots[pi->pImageIndices[i]].qualSeen = 0;
     }
     for (size_t i = 0; i < g_retired.size();) {
-      if (g_retired[i].freeAt <= n) { FreeSlots(g_retired[i].dev, g_retired[i].fn, g_retired[i].slots); g_retired.erase(g_retired.begin() + i); } else ++i;
+      if (g_retired[i].freeAt <= n) { if (g_retired[i].sharp) sharpen::Destroy(*g_retired[i].sharp); FreeSlots(g_retired[i].dev, g_retired[i].fn, g_retired[i].slots); g_retired.erase(g_retired.begin() + i); } else ++i;
     }
   }
 }
@@ -782,6 +838,14 @@ template <int P> struct H {
     if (Capturing() && g_cfg.logPasses.load()) LogImageWrite(c, "vkCmdCopyImage", di, dl, Fmt("srcImage=0x%llx regions=%u", H64(si), n).c_str());
     Pick(P_CmdCopyImage, P)(c, si, sl, di, dl, n, r);
   }
+  static void VKAPI_CALL CmdBindPipeline(VkCommandBuffer c, VkPipelineBindPoint bp, VkPipeline p) { Hit(HK_CmdBindPipeline, P); Shadowed(c, [&](sharpen::Shadow& s) { s.OnPipeline(bp, p); }); Pick(P_CmdBindPipeline, P)(c, bp, p); }
+  static void VKAPI_CALL CmdBindDescriptorSets(VkCommandBuffer c, VkPipelineBindPoint bp, VkPipelineLayout l, uint32_t first, uint32_t n, const VkDescriptorSet* sets, uint32_t dc, const uint32_t* dyn) {
+    Hit(HK_CmdBindDescriptorSets, P); Shadowed(c, [&](sharpen::Shadow& s) { s.OnSets(bp, l, first, n, sets, dc, dyn); }); Pick(P_CmdBindDescriptorSets, P)(c, bp, l, first, n, sets, dc, dyn); }
+  static void VKAPI_CALL CmdPushConstants(VkCommandBuffer c, VkPipelineLayout l, VkShaderStageFlags st, uint32_t off, uint32_t size, const void* d) { Hit(HK_CmdPushConstants, P); Shadowed(c, [&](sharpen::Shadow& s) { s.OnPush(l, st, off, size, d); }); Pick(P_CmdPushConstants, P)(c, l, st, off, size, d); }
+  static void VKAPI_CALL CmdSetViewport(VkCommandBuffer c, uint32_t first, uint32_t n, const VkViewport* v) { Hit(HK_CmdSetViewport, P); Shadowed(c, [&](sharpen::Shadow& s) { s.OnViewports(first, n, v); }); Pick(P_CmdSetViewport, P)(c, first, n, v); }
+  static void VKAPI_CALL CmdSetScissor(VkCommandBuffer c, uint32_t first, uint32_t n, const VkRect2D* v) { Hit(HK_CmdSetScissor, P); Shadowed(c, [&](sharpen::Shadow& s) { s.OnScissors(first, n, v); }); Pick(P_CmdSetScissor, P)(c, first, n, v); }
+  static void VKAPI_CALL CmdSetViewportWithCount(VkCommandBuffer c, uint32_t n, const VkViewport* v) { Hit(HK_CmdSetViewportWithCount, P); Shadowed(c, [&](sharpen::Shadow& s) { s.OnViewports(0, n, v); }); Pick(P_CmdSetViewportWithCount, P)(c, n, v); }
+  static void VKAPI_CALL CmdSetScissorWithCount(VkCommandBuffer c, uint32_t n, const VkRect2D* v) { Hit(HK_CmdSetScissorWithCount, P); Shadowed(c, [&](sharpen::Shadow& s) { s.OnScissors(0, n, v); }); Pick(P_CmdSetScissorWithCount, P)(c, n, v); }
   static void VKAPI_CALL CmdBlitImage(VkCommandBuffer c, VkImage si, VkImageLayout sl, VkImage di, VkImageLayout dl, uint32_t n, const VkImageBlit* r, VkFilter f) {
     Hit(HK_CmdBlitImage, P);
     if (Capturing() && g_cfg.logPasses.load()) LogImageWrite(c, "vkCmdBlitImage", di, dl, Fmt("srcImage=0x%llx regions=%u filter=%d", H64(si), n, (int)f).c_str());
@@ -794,6 +858,7 @@ template <int P> struct H {
   }
   static VkResult VKAPI_CALL BeginCommandBuffer(VkCommandBuffer c, const VkCommandBufferBeginInfo* bi) {
     Hit(HK_BeginCommandBuffer, P);
+    if (!g_cs.empty()) g_cs.erase(c);
     if (Capturing() && g_cfg.logCmdBegin.load()) CapLine(Fmt("%svkBeginCommandBuffer cmd=0x%llx flags=0x%x", Indent(2), H64(c), bi ? (unsigned)bi->flags : 0u));
     return Pick(P_BeginCommandBuffer, P)(c, bi);
   }

@@ -3,6 +3,7 @@
 // record what the hooks send to it. This checks logic and command ordering, NOT behaviour inside RDR2 or on a GPU.
 #include "../src/rdr2_overscan.cpp"
 #include <cassert>
+#include <cmath>
 #include <fstream>
 #include <regex>
 #include <sstream>
@@ -17,8 +18,8 @@ template <class T> static T Hn(uintptr_t n) { return (T)n; }
 static std::vector<std::string> ev;
 static int liveScratch = 0, liveMem = 0;
 static uintptr_t nextHandle = 0x2000, nextScratch = 0x9000;
-static VkImageUsageFlags lastCreateUsage = 0;
-static bool rejectBump = false;
+static VkImageUsageFlags lastCreateUsage = 0, lastScratchUsage = 0;
+static bool rejectBump = false, sharpMocks = false;
 static VkImageUsageFlags surfaceSupports = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 static VkFormatFeatureFlags formatFeatures = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
 static uint32_t nextAcquire = 0;
@@ -51,7 +52,7 @@ static VKAPI_ATTR void VKAPI_CALL mRealClear(VkCommandBuffer, VkImage, VkImageLa
 
 // device functions the mod resolves for itself
 static VKAPI_ATTR VkResult VKAPI_CALL dCreateImage(VkDevice, const VkImageCreateInfo* ci, const VkAllocationCallbacks*, VkImage* o) {
-  assert(ci->usage == (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)); assert(ci->extent.width == 1920 && ci->extent.height == 1080);
+  lastScratchUsage = ci->usage; assert((ci->usage & ~VK_IMAGE_USAGE_SAMPLED_BIT) == (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)); assert(ci->extent.width == 1920 && ci->extent.height == 1080);
   assert(ci->format == VK_FORMAT_B8G8R8A8_UNORM && ci->tiling == VK_IMAGE_TILING_OPTIMAL && ci->samples == VK_SAMPLE_COUNT_1_BIT);
   *o = Hn<VkImage>(nextScratch++); ++liveScratch; return VK_SUCCESS;
 }
@@ -78,11 +79,59 @@ static VKAPI_ATTR void VKAPI_CALL dBlit(VkCommandBuffer, VkImage s, VkImageLayou
   assert(n == 1); blits.push_back({s, d, r->srcOffsets[0], r->srcOffsets[1], r->dstOffsets[0], r->dstOffsets[1], f});
   ev.push_back("BLIT " + imgName(s) + "(" + LayoutName((int)sl) + ")->" + imgName(d) + "(" + LayoutName((int)dl) + ")");
 }
+// ---- sharpen pass mocks (all driver calls the CAS pass makes)
+static int shCreated = 0, shDestroyed = 0; static bool shFailPipe = false;
+#define SHNEW(T) { *o = Hn<T>(nextHandle++); ++shCreated; return VK_SUCCESS; }
+static VKAPI_ATTR VkResult VKAPI_CALL sCreateShader(VkDevice, const VkShaderModuleCreateInfo* c, const VkAllocationCallbacks*, VkShaderModule* o) { assert(c->codeSize % 4 == 0 && c->pCode[0] == 0x07230203u); SHNEW(VkShaderModule) }
+static VKAPI_ATTR void VKAPI_CALL sDestroyShader(VkDevice, VkShaderModule, const VkAllocationCallbacks*) { ++shDestroyed; }
+static VKAPI_ATTR VkResult VKAPI_CALL sCreateRP(VkDevice, const VkRenderPassCreateInfo*, const VkAllocationCallbacks*, VkRenderPass* o) SHNEW(VkRenderPass)
+static VKAPI_ATTR void VKAPI_CALL sDestroyRP(VkDevice, VkRenderPass, const VkAllocationCallbacks*) { ++shDestroyed; }
+static VKAPI_ATTR VkResult VKAPI_CALL sCreateFB(VkDevice, const VkFramebufferCreateInfo*, const VkAllocationCallbacks*, VkFramebuffer* o) SHNEW(VkFramebuffer)
+static VKAPI_ATTR void VKAPI_CALL sDestroyFB(VkDevice, VkFramebuffer, const VkAllocationCallbacks*) { ++shDestroyed; }
+static VKAPI_ATTR VkResult VKAPI_CALL sCreateView(VkDevice, const VkImageViewCreateInfo*, const VkAllocationCallbacks*, VkImageView* o) SHNEW(VkImageView)
+static VKAPI_ATTR void VKAPI_CALL sDestroyView(VkDevice, VkImageView, const VkAllocationCallbacks*) { ++shDestroyed; }
+static VKAPI_ATTR VkResult VKAPI_CALL sCreateSampler(VkDevice, const VkSamplerCreateInfo*, const VkAllocationCallbacks*, VkSampler* o) SHNEW(VkSampler)
+static VKAPI_ATTR void VKAPI_CALL sDestroySampler(VkDevice, VkSampler, const VkAllocationCallbacks*) { ++shDestroyed; }
+static VKAPI_ATTR VkResult VKAPI_CALL sCreateDSL(VkDevice, const VkDescriptorSetLayoutCreateInfo*, const VkAllocationCallbacks*, VkDescriptorSetLayout* o) SHNEW(VkDescriptorSetLayout)
+static VKAPI_ATTR void VKAPI_CALL sDestroyDSL(VkDevice, VkDescriptorSetLayout, const VkAllocationCallbacks*) { ++shDestroyed; }
+static VKAPI_ATTR VkResult VKAPI_CALL sCreatePool(VkDevice, const VkDescriptorPoolCreateInfo*, const VkAllocationCallbacks*, VkDescriptorPool* o) SHNEW(VkDescriptorPool)
+static VKAPI_ATTR void VKAPI_CALL sDestroyPool(VkDevice, VkDescriptorPool, const VkAllocationCallbacks*) { ++shDestroyed; }
+static VKAPI_ATTR VkResult VKAPI_CALL sAllocSets(VkDevice, const VkDescriptorSetAllocateInfo* a, VkDescriptorSet* o) { for (uint32_t i = 0; i < a->descriptorSetCount; ++i) o[i] = Hn<VkDescriptorSet>(nextHandle++); return VK_SUCCESS; }
+static VKAPI_ATTR void VKAPI_CALL sUpdateSets(VkDevice, uint32_t, const VkWriteDescriptorSet*, uint32_t, const VkCopyDescriptorSet*) {}
+static VKAPI_ATTR VkResult VKAPI_CALL sCreatePL(VkDevice, const VkPipelineLayoutCreateInfo* c, const VkAllocationCallbacks*, VkPipelineLayout* o) { assert(c->pPushConstantRanges[0].size == 32); SHNEW(VkPipelineLayout) }
+static VKAPI_ATTR void VKAPI_CALL sDestroyPL(VkDevice, VkPipelineLayout, const VkAllocationCallbacks*) { ++shDestroyed; }
+static VKAPI_ATTR VkResult VKAPI_CALL sCreatePipe(VkDevice, VkPipelineCache, uint32_t, const VkGraphicsPipelineCreateInfo*, const VkAllocationCallbacks*, VkPipeline* o) { if (shFailPipe) return VK_ERROR_INITIALIZATION_FAILED; SHNEW(VkPipeline) }
+static VKAPI_ATTR void VKAPI_CALL sDestroyPipe(VkDevice, VkPipeline, const VkAllocationCallbacks*) { ++shDestroyed; }
+static VKAPI_ATTR void VKAPI_CALL sBeginRP(VkCommandBuffer, const VkRenderPassBeginInfo* b, VkSubpassContents) { assert(b->renderArea.extent.width == 1920 && b->renderArea.extent.height == 1080); ev.push_back("SHARP_BEGIN_RP"); }
+static VKAPI_ATTR void VKAPI_CALL sEndRP(VkCommandBuffer) { ev.push_back("SHARP_END_RP"); }
+static VKAPI_ATTR void VKAPI_CALL sBindPipe(VkCommandBuffer, VkPipelineBindPoint, VkPipeline p) { ev.push_back("SHARP_BIND_PIPE " + std::to_string((uintptr_t)p)); }
+static VKAPI_ATTR void VKAPI_CALL sBindSets(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, uint32_t first, uint32_t n, const VkDescriptorSet* s, uint32_t dc, const uint32_t* d) { ev.push_back("SHARP_BIND_SET first=" + std::to_string(first) + " n=" + std::to_string(n) + " s0=" + std::to_string((uintptr_t)s[0]) + " dc=" + std::to_string(dc) + " d0=" + std::to_string(dc ? d[0] : 0)); }
+static float lastPcRect[4]; static float lastPcSharp;
+static VKAPI_ATTR void VKAPI_CALL sPush(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags st, uint32_t off, uint32_t sz, const void* p) { if (sz == 32 && off == 0) { const float* f = (const float*)p; for (int i = 0; i < 4; ++i) lastPcRect[i] = f[i]; lastPcSharp = f[6]; ev.push_back("SHARP_PUSH"); } else ev.push_back("SHARP_RESTORE_PUSH off=" + std::to_string(off) + " sz=" + std::to_string(sz) + " st=" + std::to_string(st) + " b0=" + std::to_string(((const uint8_t*)p)[0])); }
+static VKAPI_ATTR void VKAPI_CALL sSetVp(VkCommandBuffer, uint32_t first, uint32_t n, const VkViewport* v) { ev.push_back("SETVP i=" + std::to_string(first) + " h=" + std::to_string((int)v[0].height)); }
+static VKAPI_ATTR void VKAPI_CALL sSetSc(VkCommandBuffer, uint32_t first, uint32_t n, const VkRect2D* v) { ev.push_back("SETSC i=" + std::to_string(first) + " w=" + std::to_string(v[0].extent.width)); }
+// game-side (hooked) pass-throughs
+static VKAPI_ATTR void VKAPI_CALL gBindPipe(VkCommandBuffer, VkPipelineBindPoint, VkPipeline) { ev.push_back("GAME_PIPE"); }
+static VKAPI_ATTR void VKAPI_CALL gBindSets(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, uint32_t, uint32_t, const VkDescriptorSet*, uint32_t, const uint32_t*) { ev.push_back("GAME_SETS"); }
+static VKAPI_ATTR void VKAPI_CALL gPush(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, uint32_t, uint32_t, const void*) { ev.push_back("GAME_PUSH"); }
+static VKAPI_ATTR void VKAPI_CALL gSetVp(VkCommandBuffer, uint32_t, uint32_t, const VkViewport*) { ev.push_back("GAME_VP"); }
+static VKAPI_ATTR void VKAPI_CALL gSetSc(VkCommandBuffer, uint32_t, uint32_t, const VkRect2D*) { ev.push_back("GAME_SC"); }
+static VKAPI_ATTR VkResult VKAPI_CALL gBeginCmd(VkCommandBuffer, const VkCommandBufferBeginInfo*) { return VK_SUCCESS; }
+static VKAPI_ATTR void VKAPI_CALL sDraw(VkCommandBuffer, uint32_t v, uint32_t, uint32_t, uint32_t) { assert(v == 3); ev.push_back("SHARP_DRAW"); }
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL mGDPA(VkDevice, const char* n) {
 #define R(name, fn) if (!strcmp(n, name)) return (PFN_vkVoidFunction)fn
   R("vkCreateImage", dCreateImage); R("vkDestroyImage", dDestroyImage); R("vkGetImageMemoryRequirements", dGetReq);
   R("vkAllocateMemory", dAlloc); R("vkFreeMemory", dFree); R("vkBindImageMemory", dBind);
   R("vkCmdPipelineBarrier", dBarrier); R("vkCmdCopyImage", dCopy); R("vkCmdBlitImage", dBlit);
+  if (sharpMocks) {
+    R("vkCreateShaderModule", sCreateShader); R("vkDestroyShaderModule", sDestroyShader); R("vkCreateRenderPass", sCreateRP); R("vkDestroyRenderPass", sDestroyRP);
+    R("vkCreateFramebuffer", sCreateFB); R("vkDestroyFramebuffer", sDestroyFB); R("vkCreateImageView", sCreateView); R("vkDestroyImageView", sDestroyView);
+    R("vkCreateSampler", sCreateSampler); R("vkDestroySampler", sDestroySampler); R("vkCreateDescriptorSetLayout", sCreateDSL); R("vkDestroyDescriptorSetLayout", sDestroyDSL);
+    R("vkCreateDescriptorPool", sCreatePool); R("vkDestroyDescriptorPool", sDestroyPool); R("vkAllocateDescriptorSets", sAllocSets); R("vkUpdateDescriptorSets", sUpdateSets);
+    R("vkCreatePipelineLayout", sCreatePL); R("vkDestroyPipelineLayout", sDestroyPL); R("vkCreateGraphicsPipelines", sCreatePipe); R("vkDestroyPipeline", sDestroyPipe);
+    R("vkCmdBeginRenderPass", sBeginRP); R("vkCmdEndRenderPass", sEndRP); R("vkCmdBindPipeline", sBindPipe); R("vkCmdBindDescriptorSets", sBindSets);
+    R("vkCmdPushConstants", sPush); R("vkCmdDraw", sDraw); R("vkCmdSetViewport", sSetVp); R("vkCmdSetScissor", sSetSc);
+  }
 #undef R
   return nullptr;
 }
@@ -230,7 +279,7 @@ int main() {
   Reset(); g_pd = nullptr; sc = MakeSwapchain(); CHECK(!g_sc[sc]->usable);               // no physical device known
 
   // ================= 9. pause/resume: zoom stays off until stable, then eases in; flicker never zooms
-  { Reset(); sc = MakeSwapchain(); g_cfg.engageFrames = 4; g_cfg.rampFrames = 10;
+  { Reset(); sc = MakeSwapchain(); g_cfg.engageFrames = 4; g_cfg.rampFrames = 10; g_cfg.holdZoom = false;   // legacy reset-on-pause path
     Pass a = MakePass(0, VK_ATTACHMENT_LOAD_OP_LOAD, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     auto Frame = [&](bool scene) { blits.clear(); ev.clear(); if (scene) Begin(kCmd, a); Present(sc, 0); };
     int zoomed = 0; for (int i = 0; i < 4; ++i) { Frame(true); zoomed += !blits.empty(); }
@@ -241,6 +290,68 @@ int main() {
     Frame(false); Frame(true); CHECK(blits.empty());                                     // pause resets the streak: off again
     for (int i = 0; i < 20; ++i) { Frame(i % 2 == 0); CHECK(blits.empty()); }            // flicker never reaches the engage threshold
     g_cfg.engageFrames = 0; g_cfg.rampFrames = 0; }
+  // ================= 9e. CAS pass: lazy build, command order, layouts, fallback, teardown
+  { const VkFormatFeatureFlags saved = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    Pass a = MakePass(0, VK_ATTACHMENT_LOAD_OP_LOAD, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    auto Setup = [&](bool mocks, bool samplable) { Reset(); sharpMocks = mocks; shCreated = shDestroyed = 0; shFailPipe = false;
+      formatFeatures = saved | (samplable ? (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) : 0); g_cfg.sharp = 0.5; sc = MakeSwapchain(); a = MakePass(0, VK_ATTACHMENT_LOAD_OP_LOAD, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL); Present(sc, 0); };
+    // sharpness 0 -> plain blit, nothing built
+    Setup(true, true); g_cfg.sharp = 0.0; blits.clear(); Begin(kCmd, a); CHECK(blits.size() == 1 && shCreated == 0 && (lastScratchUsage & VK_IMAGE_USAGE_SAMPLED_BIT));
+    // sharpness > 0 -> shader pass, no blit
+    g_cfg.sharp = 0.5; Present(sc, 0); blits.clear(); ev.clear(); Begin(kCmd, a);
+    CHECK(blits.empty() && shCreated > 0 && g_sc[sc]->sharp->ok);
+    int ibeg = -1, idraw = -1, iend = -1, icopy = -1, ibar = 0; for (size_t i = 0; i < ev.size(); ++i) { if (ev[i] == "SHARP_BEGIN_RP") ibeg = (int)i; if (ev[i] == "SHARP_DRAW") idraw = (int)i; if (ev[i] == "SHARP_END_RP") iend = (int)i; if (ev[i].rfind("COPY", 0) == 0) icopy = (int)i; if (ev[i].rfind("BARRIER", 0) == 0) ++ibar; }
+    CHECK(icopy >= 0 && ibeg > icopy && idraw > ibeg && iend > idraw && ibar == 3 && ev[iend + 1] == "BARRIER" && ev.back() == "REAL_BEGIN_RP");   // copy -> RP -> draw -> end -> final memory barrier
+    CHECK(Has(ev[icopy + 1], "TRANSFER_DST_OPTIMAL>SHADER_READ_ONLY_OPTIMAL") && Has(ev[icopy + 1], "img0 TRANSFER_SRC_OPTIMAL>COLOR_ATTACHMENT_OPTIMAL"));
+    CHECK(lastPcSharp == 0.5f && std::fabs(lastPcRect[0] - 46.0 / 1920) < 1e-6 && std::fabs(lastPcRect[2] - 1828.0 / 1920) < 1e-6 && std::fabs(lastPcRect[3] - 1028.0 / 1080) < 1e-6);
+    int built = shCreated; Present(sc, 0); ev.clear(); Begin(kCmd, a); CHECK(shCreated == built);                         // built once
+    // pass layout other than COLOR_ATTACHMENT_OPTIMAL -> plain blit
+    Pass ro = MakePass(0, VK_ATTACHMENT_LOAD_OP_LOAD, VK_IMAGE_LAYOUT_GENERAL); Present(sc, 0); blits.clear(); Begin(kCmd, ro); CHECK(blits.size() == 1);
+    // retire: sharpen resources are freed together with the scratch images
+    shDestroyed = 0; H<0>::DestroySwapchainKHR(kDev, sc, nullptr); for (int i = 0; i < 20; ++i) { VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR}; H<0>::QueuePresentKHR(nullptr, &pi); }
+    CHECK(shDestroyed >= built - 3 && liveScratch == 0);
+    // pipeline creation fails -> permanent fallback to the blit, partial objects cleaned up
+    Setup(true, true); shFailPipe = true; blits.clear(); Begin(kCmd, a); CHECK(blits.size() == 1 && !g_sc[sc]->sharp->ok && g_sc[sc]->sharp->tried && shDestroyed > 0 && Has(g_sc[sc]->sharp->why, "vkCreateGraphicsPipelines"));
+    shFailPipe = false; Present(sc, 0); blits.clear(); Begin(kCmd, a); CHECK(blits.size() == 1);                       // does not retry every frame
+    // format without SAMPLED/COLOR_ATTACHMENT -> sharpening unsupported, blit
+    Setup(true, false); blits.clear(); Begin(kCmd, a); CHECK(blits.size() == 1 && !g_sc[sc]->sharpPossible);
+    // driver lacks the functions -> blit
+    Setup(false, true); blits.clear(); Begin(kCmd, a); CHECK(blits.size() == 1 && !g_sc[sc]->sharp->ok);
+    sharpMocks = false; g_cfg.sharp = 0.0; formatFeatures = saved; }
+  // ================= 9f. the pass puts the game's pipeline / descriptor sets / push constants / viewport back afterwards
+  { Reset(); sharpMocks = true; shCreated = shDestroyed = 0; formatFeatures |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT; g_cfg.sharp = 0.5;
+    sc = MakeSwapchain(); Pass a = MakePass(0, VK_ATTACHMENT_LOAD_OP_LOAD, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL); Present(sc, 0);
+    P_CmdBindPipeline.gp = gBindPipe; P_CmdBindDescriptorSets.gp = gBindSets; P_CmdPushConstants.gp = gPush; P_CmdSetViewport.gp = gSetVp; P_CmdSetScissor.gp = gSetSc; P_BeginCommandBuffer.gp = gBeginCmd;
+    const VkPipelineLayout lay = Hn<VkPipelineLayout>(0x66); const VkDescriptorSet ds[2] = {Hn<VkDescriptorSet>(0x71), Hn<VkDescriptorSet>(0x72)}; const uint32_t dynOff = 256, pc[4] = {7, 2, 3, 4};
+    const VkViewport gv{0.f, 1080.f, 1920.f, -1080.f, 0.f, 1.f}; const VkRect2D gs{{0, 0}, {1920, 1080}};
+    ev.clear(); H<0>::BeginCommandBuffer(kCmd, nullptr);
+    H<0>::CmdBindPipeline(kCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, Hn<VkPipeline>(0x777)); H<0>::CmdBindPipeline(kCmd, VK_PIPELINE_BIND_POINT_COMPUTE, Hn<VkPipeline>(0x888));
+    H<0>::CmdBindDescriptorSets(kCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lay, 1, 2, ds, 1, &dynOff);
+    H<0>::CmdPushConstants(kCmd, lay, VK_SHADER_STAGE_VERTEX_BIT, 4, 16, pc); H<0>::CmdSetViewport(kCmd, 0, 1, &gv); H<0>::CmdSetScissor(kCmd, 0, 1, &gs);
+    CHECK(Count("GAME_") == 6);                                                              // every call still reaches the driver
+    ev.clear(); Begin(kCmd, a);
+    size_t e = 0; while (e < ev.size() && ev[e] != "SHARP_END_RP") ++e; CHECK(e < ev.size());
+    std::vector<std::string> after(ev.begin() + (e < ev.size() ? e + 1 : 0), ev.end());
+    CHECK(after.size() >= 7 && after[0] == "SHARP_BIND_PIPE 1911");                           // 0x777: the graphics pipeline (compute bind ignored)
+    CHECK(after.size() >= 7 && after[1] == "SHARP_BIND_SET first=1 n=2 s0=113 dc=1 d0=256");
+    CHECK(after.size() >= 7 && after[2] == "SHARP_RESTORE_PUSH off=4 sz=16 st=1 b0=7");
+    CHECK(after.size() >= 7 && after[3] == "SETVP i=0 h=-1080" && after[4] == "SETSC i=0 w=1920");
+    CHECK(after.size() >= 6 && after[5] == "BARRIER");                                          // restore comes before the final memory barrier
+    bool ourVp = false; for (size_t i = 0; i < e; ++i) if (ev[i] == "SETVP i=0 h=1080") ourVp = true; CHECK(ourVp);   // our own pass used a positive-height viewport
+    // a new recording starts from nothing: no restore calls
+    Present(sc, 0); ev.clear(); H<0>::BeginCommandBuffer(kCmd, nullptr); Begin(kCmd, a);
+    e = 0; while (e < ev.size() && ev[e] != "SHARP_END_RP") ++e; CHECK(e < ev.size() && ev[e + 1] == "BARRIER");
+    // Sharpness 0 -> nothing is shadowed at all
+    g_cfg.sharp = 0.0; g_cs.clear(); H<0>::CmdBindPipeline(kCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, Hn<VkPipeline>(0x777)); CHECK(g_cs.empty());
+    sharpMocks = false; formatFeatures = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT; }
+  // ================= 9b. HoldZoomOnPause: pausing keeps the zoom engaged, no re-ramp while paused
+  { Reset(); sc = MakeSwapchain(); g_cfg.engageFrames = 4; g_cfg.rampFrames = 10; g_cfg.holdZoom = true;
+    Pass a = MakePass(0, VK_ATTACHMENT_LOAD_OP_LOAD, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    auto Frame = [&](bool scene) { blits.clear(); ev.clear(); if (scene) Begin(kCmd, a); Present(sc, 0); };
+    for (int i = 0; i < 20; ++i) Frame(true); CHECK(blits.size() == 1 && blits[0].s0.x == 46);
+    Frame(false); Frame(false); Frame(true); CHECK(blits.size() == 1 && blits[0].s0.x == 46);      // paused background: full zoom at once
+    for (int i = 0; i < 5; ++i) { Frame(i % 2 == 0); if (i % 2 == 0) CHECK(blits.size() == 1 && blits[0].s0.x == 46); }
+    g_cfg.holdZoom = true; g_cfg.engageFrames = 0; g_cfg.rampFrames = 0; }
 
   // ================= 10. RequireDepthWrite: only the main scene pass (swapchain LOAD + writable depth) is transformed, whatever the recording order
   { Reset(); sc = MakeSwapchain(); g_cfg.requireDepth = true;
