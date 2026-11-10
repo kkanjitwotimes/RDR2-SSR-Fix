@@ -15,9 +15,15 @@ On first run it creates the config file (RDR2Overscan.ini) next to the ASI, you 
 
 Zoom is responsible for the amount of, well, zoom, higher number = less artifacts but narrower FOV.
 
-EngageFrames and RampFrames control a zoom function on menu enter and exit, previously exiting a menu/loading in caused the zoom and not-zoomed view to fight and flicker, this jank-i-ly fixes that by employing EngageFrames (how many frames after unpausing until it starts zooming in) and RampFrames (how many frames until fully zoomed)
+HoldZoomOnPause keeps the zoom while paused so the background no longer unzooms and rezooms. 
 
-The logging feature takes 'snapshots' of the graphics pipeline under the hood upon initiating a hot key (default is backslash) for debugging and analysis.
+Sharpness enables AMDs CAS sharpening on the zoomed, 3D scene only, avoiding UI, it's configurable 0.0-1.0, start at 0.5. Report bugs!
+
+PauseGapFix finally kills the annoying ass flicker on unpause!
+
+Logging is better specified in the configurable INI, used for debugging/analysis :p
+
+If you experience any glitches, check the `Debug` section in the ini!
 # Build Me :3 
 **Download RDR2.Vulkan.Overscan_source.zip for the version you're building from the `Releases` tab**
 
@@ -46,3 +52,6 @@ The output is build/RDR2OverscanVK.asi.
 ASI loader: https://github.com/ThirteenAG/Ultimate-ASI-Loader
 
 Mod on Nexus: https://www.nexusmods.com/reddeadredemption2/mods/11546
+
+<img width="1917" height="1078" alt="Screenshot 2026-11-09 023551" src="https://github.com/user-attachments/assets/44c5fdcb-9ebe-4a72-8c58-e5954c9e6df5" />
+<img width="1917" height="1076" alt="Screenshot 2026-11-09 171541" src="https://github.com/user-attachments/assets/5b26a51d-2c7b-42c1-8c58-c211d4e5d2e3" />
