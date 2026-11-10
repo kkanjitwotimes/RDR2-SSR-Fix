@@ -1,4 +1,4 @@
-// RDR2 Vulkan overscan v0.1.0 (ASI).
+// RDR2 Vulkan overscan v0.1.1 (ASI).
 //
 // What it does: just before the first full-screen render pass that LOADs the backbuffer (the point the
 // reference FG mod uses as "pre-HUD"), it records  copy backbuffer -> private scratch, then
@@ -8,6 +8,9 @@
 // What it logs: nothing, until the capture key is pressed. Then it records CaptureFrames frames of
 // pass / submit / hook information to RDR2Overscan.log (opened and closed per write, so the file can be
 // edited or deleted while the game runs). The INI is re-read while the game runs.
+//
+// v0.1.1: PauseGapMaxFrames default 3 -> 30. The first pause after launch loads the pause menu for ~11 scene-less
+// frames (later pauses: 2-3), so the tail of that gap stayed unzoomed; the present-time zoom now covers it.
 //
 // v0.1.0: alt-pass mode. Startup / NPC-focus camera frames have no depth-writing scene pass, only a swapchain LOAD pass
 // with read-only depth at the same point of the frame. After AltEngageFrames such frames in a row that pass is zoomed
@@ -115,7 +118,7 @@ struct Config {
   std::atomic<bool> menuGuard{true};    // suspend the zoom while scene / scene-less frames alternate (title menu)
   std::atomic<bool> altPass{true};      // alt-pass mode: scene frames that only have a read-only-depth swapchain pass (startup / NPC focus camera)
   std::atomic<int> altEngage{3};        // consecutive such frames before the alt pass is zoomed
-  std::atomic<int> gapMax{3};           // longest run of scene-less frames that still gets the present-time zoom
+  std::atomic<int> gapMax{30};           // longest run of scene-less frames that still gets the present-time zoom
   std::atomic<bool> logDraws{true};     // v0.0.4: per-swapchain-pass draw/descriptor summary in captures
   std::atomic<int> logDesc{1};          // 0 off, 1 track descriptor image writes only while capturing, 2 always (costly)
 };
@@ -132,7 +135,7 @@ static void WriteDefaultIni() {
   if (GetFileAttributesW(g_iniPath.c_str()) != INVALID_FILE_ATTRIBUTES) return;
   const char* text =
     "; ==============================================================================\r\n"
-    "; RDR2 Vulkan overscan v0.1.0\r\n"
+    "; RDR2 Vulkan overscan v0.1.1\r\n"
     "; Saved changes are picked up while the game is running (checked about once a second).\r\n"
     "; ==============================================================================\r\n"
     "\r\n"
@@ -206,8 +209,10 @@ static void WriteDefaultIni() {
     "MenuCadenceGuard=1\r\n"
     "\r\n"
     "; Longest run of scene-less frames that still gets the PauseGapFix zoom.\r\n"
-    "; Longer runs (loading screens, main menu) are left untouched.\r\n"
-    "PauseGapMaxFrames=3\r\n"
+    "; Longer runs (loading screens, main menu) are left untouched. The first pause after\r\n"
+    "; launch needs ~11 frames, later ones 2-3; too low a value leaves part of the first\r\n"
+    "; pause menu unzoomed (max 60).\r\n"
+    "PauseGapMaxFrames=30\r\n"
     "\r\n"
     "; Some camera modes (right after launch, NPC focus) have no scene pass that writes depth; the\r\n"
     "; scene is then followed by a pass with read-only depth instead. 1 = after AltEngageFrames such\r\n"
@@ -240,7 +245,7 @@ static void LoadIni() {
   g_cfg.logSubmits = GetPrivateProfileIntW(L"Log", L"LogSubmits", 1, f) != 0;
   g_cfg.logCmdBegin = GetPrivateProfileIntW(L"Log", L"LogCommandBufferBegin", 1, f) != 0;
   g_cfg.pauseGap = GetPrivateProfileIntW(L"Overscan", L"PauseGapFix", 1, f) != 0;
-  { int gm = DI(L"PauseGapMaxFrames", 3); g_cfg.gapMax = gm < 0 ? 0 : gm > 60 ? 60 : gm; }
+  { int gm = DI(L"PauseGapMaxFrames", 30); g_cfg.gapMax = gm < 0 ? 0 : gm > 60 ? 60 : gm; }
   g_cfg.menuGuard = DI(L"MenuCadenceGuard", 1) != 0;
   g_cfg.altPass = DI(L"AltPassMode", 1) != 0;
   { int ae = DI(L"AltEngageFrames", 3); g_cfg.altEngage = ae < 1 ? 1 : ae > 60 ? 60 : ae; }
@@ -792,7 +797,7 @@ static void BeginCapture() {
 
   std::string h = Fmt("[%s] CAPTURE #%u BEGIN  frames=%u key=0x%x\n", Now().c_str(), g_cap.id, g_cap.total, g_cfg.captureKey.load());
   h += Fmt("%sconfig: enabled=%d zoom=%.4f transformPassIndex=%d logPasses=%d logSubmits=%d logCmdBegin=%d\n", Indent(1), (int)g_cfg.enabled.load(), g_cfg.zoom.load(), g_cfg.passIndex.load(), (int)g_cfg.logPasses.load(), (int)g_cfg.logSubmits.load(), (int)g_cfg.logCmdBegin.load());
-  h += Fmt("%sconfig v0.1.0: pauseGapFix=%d pauseGapMaxFrames=%d menuGuard=%d(active=%d) holdZoom=%d requireDepth=%d engageFrames=%d rampFrames=%d logDrawDiagnostics=%d logDescriptorImages=%d tracked images=%zu descriptor sets=%zu\n", Indent(1), (int)g_cfg.pauseGap.load(), g_cfg.gapMax.load(), (int)g_cfg.menuGuard.load(), (int)g_menuMode.load(), (int)g_cfg.holdZoom.load(), (int)g_cfg.requireDepth.load(), g_cfg.engageFrames.load(), g_cfg.rampFrames.load(), (int)g_cfg.logDraws.load(), g_cfg.logDesc.load(), g_imgInfo.size(), g_desc.size());
+  h += Fmt("%sconfig v0.1.1: pauseGapFix=%d pauseGapMaxFrames=%d menuGuard=%d(active=%d) holdZoom=%d requireDepth=%d engageFrames=%d rampFrames=%d logDrawDiagnostics=%d logDescriptorImages=%d tracked images=%zu descriptor sets=%zu\n", Indent(1), (int)g_cfg.pauseGap.load(), g_cfg.gapMax.load(), (int)g_cfg.menuGuard.load(), (int)g_menuMode.load(), (int)g_cfg.holdZoom.load(), (int)g_cfg.requireDepth.load(), g_cfg.engageFrames.load(), g_cfg.rampFrames.load(), (int)g_cfg.logDraws.load(), g_cfg.logDesc.load(), g_imgInfo.size(), g_desc.size());
   h += Fmt("%salt pass mode: enabled=%d active=%d engageFrames=%d run=%u\n", Indent(1), (int)g_cfg.altPass.load(), (int)g_altMode.load(), g_cfg.altEngage.load(), g_altRun.load());
   h += Fmt("%sprocess: pid=%lu presents so far=%llu\n", Indent(1), (unsigned long)GetCurrentProcessId(), (unsigned long long)g_presents.load());
   {

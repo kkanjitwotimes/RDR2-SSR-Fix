@@ -486,6 +486,8 @@ int main() {
     Frame(true); Frame(false); CHECK(Count("PZ_SUBMIT") == 1);                                                       // a scene frame re-arms it
     // zero wait semaphores is fine too
     ev.clear(); Present(sc, 0); CHECK(Count("PZ_SUBMIT") == 1 && lastSubmitWaits == 0);
+    // first pause after launch: ~11 scene-less frames in a row; with the v0.1.1 default (30) all are zoomed, frame 31 is not
+    g_cfg.gapMax = 30; Frame(true); for (int i = 1; i <= 30; ++i) { Frame(false); CHECK(Count("PZ_SUBMIT") == 1); } Frame(false); CHECK(Count("PZ_SUBMIT") == 0); g_cfg.gapMax = 3;
     // gates
     Setup(); a = MakePass(0, VK_ATTACHMENT_LOAD_OP_LOAD, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     ev.clear(); Present(sc, 0); Present(sc, 0); CHECK(Count("PZ_SUBMIT") == 0);                                      // never saw a scene frame (startup / menus)
@@ -547,7 +549,7 @@ int main() {
     CHECK(Has(lg, "pass#1 samples set 0x71 binding 2[0] -> image 0x7000 1920x1080 fmt=R16G16B16A16_SFLOAT(97) RT"));      // offscreen render target
     CHECK(Has(lg, "pass#1 samples set 0x72 binding 0[0] -> SWAPCHAIN image[1]"));                                          // sampling a swapchain image
     CHECK(Has(lg, "sets with no known image descriptors") && Has(lg, "0x73"));                                             // set 3 was never written
-    CHECK(Has(lg, "config v0.1.0: pauseGapFix=0") && Has(lg, "gapFix=idle") && Has(lg, "present #") && Has(lg, "PauseGapFix off"));
+    CHECK(Has(lg, "config v0.1.1: pauseGapFix=0") && Has(lg, "gapFix=idle") && Has(lg, "present #") && Has(lg, "PauseGapFix off"));
     // outside a capture the draw hooks record nothing and descriptor writes are not tracked (LogDescriptorImages=1)
     g_pdiag.clear(); { std::lock_guard<std::mutex> l(g_dmu); g_desc.clear(); }
     H<0>::CmdDraw(kCmd, 3, 1, 0, 0); H<0>::UpdateDescriptorSets(kDev, 2, w, 0, nullptr); CHECK(g_pdiag.empty() && g_desc.empty());
